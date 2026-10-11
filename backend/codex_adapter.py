@@ -287,8 +287,25 @@ _DUCKY_TOOLS_HINT = (
     "aren't, they are inside your exec tool: call them as "
     "`await tools.mcp__uefn__<tool_name>({...})` (e.g. tools.mcp__uefn__ducky_get_plan) "
     "and list them with Object.keys(tools). Never conclude Ducky tools are missing "
-    "without checking there."
+    "without checking there. Use Ducky's tools only: your shell, sub-agents and web search "
+    "are off. Run commands with ducky_terminal_open then ducky_terminal_run, and edit files "
+    "with Ducky's workspace_* edit tools, never apply_patch."
 )
+
+# Ducky's tools ride on every Ducky turn, so Codex's own are off: commands run in a Ducky
+# terminal the person can watch and stop, helpers are Ducky chats, the web is Ducky's
+# web_search, pictures go through view_image. Codex cannot switch apply_patch off; the
+# rules above tell it never to use it.
+DUCKY_ONLY_FLAGS = [
+    "-c", "features.shell_tool=false",
+    "-c", "features.unified_exec=false",
+    "-c", "features.multi_agent=false",
+    "-c", "features.browser_use=false",
+    "-c", "features.computer_use=false",
+    "-c", "features.image_generation=false",
+    "-c", "features.view_image=false",
+    "-c", 'web_search="disabled"',
+]
 
 
 def ducky_launch_flags(mode: str = "agent") -> list[str]:
@@ -1338,7 +1355,7 @@ class CodexAdapter:
         )
         # Last command-specific override wins over saved Agent extras. This
         # immutable value is reused on setup repair and works with resume.
-        argv[-1:-1] = ["-c", profile_ready]
+        argv[-1:-1] = ["-c", profile_ready, *DUCKY_ONLY_FLAGS]
         state = _CodexStream(conv_id, run_id, push)
         if session_id:
             push({"type": "status", "text": "Resumed Codex session…", "conv_id": conv_id, "run_id": run_id})

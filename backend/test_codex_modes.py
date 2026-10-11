@@ -307,6 +307,11 @@ def assert_mode_argv(argv, mode, session_id):
     assert "mcp_servers.uefn.required=true" in argv
     assert 'mcp_servers.uefn.default_tools_approval_mode="approve"' in argv
     assert "tools.mcp__uefn__" in argv[-1]
+    # Every Ducky turn, any mode: Codex's own shell, helpers and web are off.
+    for flag in ("features.shell_tool=false", "features.unified_exec=false",
+                 "features.multi_agent=false", 'web_search="disabled"'):
+        assert argv[argv.index(flag) - 1] == "-c"
+    assert "never apply_patch" in argv[-1]
     assert "--full-auto" not in argv
     if mode == "agent":
         assert "--dangerously-bypass-approvals-and-sandbox" in argv
