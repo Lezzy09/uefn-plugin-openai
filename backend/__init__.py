@@ -98,6 +98,9 @@ def register(api) -> None:
         token_provider="openai",
         normalize_model=_normalize_codex_model,
         shows_thinking_effort=True,
+        # Codex works through Ducky's tools only, so Ducky's approval modes apply to it:
+        # Ducky asks before its file changes (Ask before changes) and its terminal commands.
+        chat_permission_modes=("ask", "edits", "all"),
     )
     api.register_ide_hookup("codex", label="Codex")
     try:
