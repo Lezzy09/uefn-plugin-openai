@@ -294,18 +294,44 @@ _DUCKY_TOOLS_HINT = (
 
 # Ducky's tools ride on every Ducky turn, so Codex's own are off: commands run in a Ducky
 # terminal the person can watch and stop, helpers are Ducky chats, the web is Ducky's
-# web_search, pictures go through view_image. Codex cannot switch apply_patch off; the
-# rules above tell it never to use it.
+# web_search, pictures it looks at go through view_image. Codex cannot switch apply_patch
+# off; the rules above tell it never to use it. Image generation stays on: it runs nothing
+# and edits nothing, and the pictures it makes show in the chat (_keep_codex_pictures).
 DUCKY_ONLY_FLAGS = [
     "-c", "features.shell_tool=false",
     "-c", "features.unified_exec=false",
     "-c", "features.multi_agent=false",
     "-c", "features.browser_use=false",
     "-c", "features.computer_use=false",
-    "-c", "features.image_generation=false",
     "-c", "features.view_image=false",
     "-c", 'web_search="disabled"',
 ]
+
+
+_PICTURE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp"}
+
+
+def _keep_codex_pictures(home: Path, thread_id: str, conv_id: str, since: float) -> int:
+    """Pictures Codex made this turn go to the chat, which shows them under the reply.
+
+    Codex saves each one under CODEX_HOME/generated_images/<thread id>/; its JSON output
+    does not report them.
+    """
+    folder = home / "generated_images" / str(thread_id or "")
+    if not thread_id or not conv_id or not folder.is_dir():
+        return 0
+    try:
+        from frontend.ui_web.generated_images import note_image_file
+    except ImportError:
+        return 0  # a Ducky without inline pictures
+    kept = 0
+    for path in sorted(folder.iterdir(), key=lambda item: item.stat().st_mtime):
+        try:
+            if path.suffix.lower() in _PICTURE_SUFFIXES and path.is_file() and path.stat().st_mtime >= since - 1:
+                kept += bool(note_image_file(path, conv_id=conv_id, gateway="codex"))
+        except OSError:
+            continue
+    return kept
 
 
 def ducky_launch_flags(mode: str = "agent") -> list[str]:
@@ -1251,6 +1277,7 @@ class CodexAdapter:
             )
         original_push = push
         env = dict(env or {})
+        turn_started = time.time()
 
         def push(event: dict[str, Any]) -> None:
             original_push({**event, "requested_mode": mode, "effective_mode": ""})
@@ -1268,6 +1295,8 @@ class CodexAdapter:
             # Success confirms configured native sandbox, not MCP permissions.
             if "effective_mode" in _RESULT_PARAMETERS:
                 result.effective_mode = mode if result.ok else ""
+            home = Path(env.get("CODEX_HOME") or _codex_home())
+            _keep_codex_pictures(home, result.upstream_session_id or session_id, conv_id, turn_started)
             return result
 
         model_id = normalize_codex_model(model)
