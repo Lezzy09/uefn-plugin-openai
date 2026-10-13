@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from typing import Any, AsyncIterator
 
 from backend.agent.multimodal_content import build_openai_user_content
@@ -185,11 +186,28 @@ def _responses_usage(usage: Any) -> dict[str, int]:
     }
 
 
+def replay_reasoning_field() -> str:
+    """Chat Completions field that carries a prior step's reasoning back, or "".
+
+    api.openai.com has no such field: its chat models never return reasoning, and a
+    stale ``thinking`` left in history by another model's turns must not be sent
+    there. An OpenAI-compatible endpoint behind ``OPENAI_BASE_URL`` (DeepSeek, vLLM,
+    …) takes ``reasoning_content``: DeepSeek's thinking mode requires it back on every
+    request that carries tools (400 otherwise), and a reasoning model that never sees
+    its own earlier reasoning re-derives the same analysis on every tool step.
+    """
+    base = (os.environ.get("OPENAI_BASE_URL") or "").strip().lower()
+    if not base or "api.openai.com" in base:
+        return ""
+    return "reasoning_content"
+
+
 class OpenAIProvider:
     def __init__(self, api_key: str, model: str, *, thinking_effort: str = "off", **_kw: Any) -> None:
         self._api_key = api_key
         self._model = model
         self._thinking_effort = normalize_thinking_effort(thinking_effort)
+        self._reasoning_field = replay_reasoning_field()
 
     def _client(self):
         from openai import OpenAI
@@ -215,29 +233,38 @@ class OpenAIProvider:
                 )
                 continue
             if m.role == "assistant" and m.tool_calls:
-                out.append(
-                    {
-                        "role": "assistant",
-                        "content": m.content or None,
-                        "tool_calls": [
-                            {
-                                "id": tc.id,
-                                "type": "function",
-                                "function": {
-                                    "name": tc.name,
-                                    "arguments": json.dumps(tc.arguments),
-                                },
-                            }
-                            for tc in m.tool_calls
-                        ],
-                    }
-                )
+                msg: dict[str, Any] = {
+                    "role": "assistant",
+                    "content": m.content or None,
+                    "tool_calls": [
+                        {
+                            "id": tc.id,
+                            "type": "function",
+                            "function": {
+                                "name": tc.name,
+                                "arguments": json.dumps(tc.arguments),
+                            },
+                        }
+                        for tc in m.tool_calls
+                    ],
+                }
+                self._attach_reasoning(msg, m)
+                out.append(msg)
                 continue
             if m.role == "user" and m.attachments:
                 out.append({"role": "user", "content": build_openai_user_content(m.content, m.attachments)})
                 continue
-            out.append({"role": m.role, "content": m.content})
+            msg = {"role": m.role, "content": m.content}
+            if m.role == "assistant":
+                self._attach_reasoning(msg, m)
+            out.append(msg)
         return out
+
+    def _attach_reasoning(self, msg: dict[str, Any], m: ProviderMessage) -> None:
+        """Send the step's own reasoning back where the endpoint expects it (see
+        ``replay_reasoning_field``); nothing for api.openai.com."""
+        if self._reasoning_field and (m.thinking or "").strip():
+            msg[self._reasoning_field] = m.thinking
 
     def _instructions(self, system: str, cache: PromptCachePayload | None) -> str:
         return "\n\n".join(
