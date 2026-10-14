@@ -297,6 +297,49 @@ _DUCKY_TOOLS_HINT = (
 # web_search, pictures it looks at go through view_image. Codex cannot switch apply_patch
 # off; the rules above tell it never to use it. Image generation stays on: it runs nothing
 # and edits nothing, and the pictures it makes show in the chat (_keep_codex_pictures).
+# Codex reconnects a dead Responses stream by itself (its own idle timeout is minutes),
+# so a run that prints no line at all for this long is wedged, not thinking: the longest
+# silent reasoning step measured on a 144k-token gpt-6.1-sol thread was 2.5 minutes
+# (Oct 13 2026, 30 steps). Ducky stops such a run and resumes the thread once.
+CODEX_SILENCE_LIMIT_S = 15 * 60
+
+
+class _SilenceWatchdog:
+    """Stops a Codex run that has printed nothing for ``limit_s``.
+
+    ``cancel`` is what ``run_streaming_process`` watches: it fires on the person's own
+    stop (forwarded from ``user_cancel``) or on silence; ``stalled`` tells the two apart.
+    """
+
+    def __init__(self, user_cancel: threading.Event | None, limit_s: float) -> None:
+        self.user_cancel = user_cancel
+        self.limit_s = float(limit_s)
+        self.cancel = threading.Event()
+        self.stalled = False
+        self._last = time.monotonic()
+        self._stop = threading.Event()
+
+    def touch(self) -> None:
+        self._last = time.monotonic()
+
+    def _run(self) -> None:
+        while not self._stop.wait(0.25):
+            if self.user_cancel is not None and self.user_cancel.is_set():
+                self.cancel.set()
+                return
+            if time.monotonic() - self._last >= self.limit_s:
+                self.stalled = True
+                self.cancel.set()
+                return
+
+    def __enter__(self) -> _SilenceWatchdog:
+        threading.Thread(target=self._run, daemon=True, name="codex-silence").start()
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        self._stop.set()
+
+
 _STREAM_DROP_MARKERS = (
     "stream disconnected",
     "websocket closed",
@@ -1401,21 +1444,32 @@ class CodexAdapter:
         # Last command-specific override wins over saved Agent extras. This
         # immutable value is reused on setup repair and works with resume.
         argv[-1:-1] = ["-c", profile_ready, *DUCKY_ONLY_FLAGS]
+        def run_codex(argv: list[str], state: _CodexStream) -> tuple[Any, bool]:
+            """One Codex process; True when the silence watchdog, not the person, stopped it."""
+            with _SilenceWatchdog(cancel, CODEX_SILENCE_LIMIT_S) as watchdog:
+
+                def on_line(line: str) -> None:
+                    watchdog.touch()
+                    state.on_line(line)
+
+                proc = run_streaming_process(
+                    argv=argv,
+                    cwd=cwd,
+                    env_extra=env,
+                    conv_id=conv_id,
+                    on_line=on_line,
+                    timeout_s=timeout_s,
+                    cancel=watchdog.cancel,
+                    stdin_data=stdin_prompt,
+                )
+            return proc, watchdog.stalled
+
         state = _CodexStream(conv_id, run_id, push)
         if session_id:
             push({"type": "status", "text": "Resumed Codex session…", "conv_id": conv_id, "run_id": run_id})
         else:
             push({"type": "status", "text": "Starting Codex…", "conv_id": conv_id, "run_id": run_id})
-        proc = run_streaming_process(
-            argv=argv,
-            cwd=cwd,
-            env_extra=env,
-            conv_id=conv_id,
-            on_line=state.on_line,
-            timeout_s=timeout_s,
-            cancel=cancel,
-            stdin_data=stdin_prompt,
-        )
+        proc, stalled = run_codex(argv, state)
 
         # Never leave a chip spinning: whatever ended this turn, resolve leftovers.
         state.finish_unresolved_tools(cancelled=proc.cancelled)
@@ -1443,20 +1497,31 @@ class CodexAdapter:
         def retry_stopped() -> bool:
             # Terminal output can also contain repair markers. Never replay
             # uncertain work, or begin repair after observing cancellation.
-            return (proc.cancelled or proc.timed_out
-                    or result.status in ("cancelled", "timeout")
-                    or (cancel is not None and cancel.is_set()))
+            if cancel is not None and cancel.is_set():
+                return True
+            if stalled:
+                return False  # the silence watchdog stopped this run, not the person
+            return proc.cancelled or proc.timed_out or result.status in ("cancelled", "timeout")
 
+        silent_minutes = int(CODEX_SILENCE_LIMIT_S // 60)
         if retry_stopped():
             return with_mode(result)
-        if not result.ok and is_stream_drop(result.error, state.error_text, proc.stderr_tail, proc.raw_tail):
+        dropped = (not result.ok) and is_stream_drop(
+            result.error, state.error_text, proc.stderr_tail, proc.raw_tail
+        )
+        if stalled or dropped:
             # Codex's Responses WebSocket was closed by OpenAI mid-turn (an open Codex
-            # CLI issue; it reconnects, then gives up). The thread is intact, so run the
-            # same turn once more on it instead of leaving the chat stuck on an error.
+            # CLI issue; it reconnects, then gives up), or the CLI wedged and printed
+            # nothing for a quarter of an hour. The thread is intact either way, so
+            # run the same turn once more on it instead of leaving the chat stuck.
             push(
                 {
                     "type": "status",
-                    "text": "Codex's connection to OpenAI dropped mid-turn — retrying once…",
+                    "text": (
+                        f"Codex printed nothing for {silent_minutes} minutes — restarting the step on the same thread…"
+                        if stalled
+                        else "Codex's connection to OpenAI dropped mid-turn — retrying once…"
+                    ),
                     "conv_id": conv_id,
                     "run_id": run_id,
                 }
@@ -1475,16 +1540,7 @@ class CodexAdapter:
             )
             argv[-1:-1] = ["-c", profile_ready, *DUCKY_ONLY_FLAGS]
             state = _CodexStream(conv_id, run_id, push)
-            proc = run_streaming_process(
-                argv=argv,
-                cwd=cwd,
-                env_extra=env,
-                conv_id=conv_id,
-                on_line=state.on_line,
-                timeout_s=timeout_s,
-                cancel=cancel,
-                stdin_data=stdin_prompt,
-            )
+            proc, stalled = run_codex(argv, state)
             state.finish_unresolved_tools(cancelled=proc.cancelled)
             blocks = state.finalize_blocks()
             streamed_all = "".join(state.text_parts).strip()
@@ -1504,6 +1560,14 @@ class CodexAdapter:
                 stale_session_markers=("resume", "not found"),
             )
             if retry_stopped():
+                return with_mode(result)
+            if stalled:
+                result.ok = False
+                result.status = "error"
+                result.error = (
+                    f"Codex printed nothing for {silent_minutes} minutes twice in a row, so Ducky "
+                    "stopped the turn. Send the message again to continue on the same thread."
+                )
                 return with_mode(result)
         if result.ok or not should_heal_launch(
             result.error or "",

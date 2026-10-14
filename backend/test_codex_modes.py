@@ -679,3 +679,65 @@ def test_a_real_error_is_not_retried(launch_env):
     result = adapter.CodexAdapter().launch(**kwargs, mode="agent")
     assert adapter.run_streaming_process.call_count == 1
     assert not result.ok
+
+
+def _silent_run(calls, reply=""):
+    """A Codex process that prints its thread id and then nothing until it is stopped."""
+
+    def run(**call):
+        calls.append(call)
+        call["on_line"](json.dumps({"type": "thread.started", "thread_id": "thread-one"}))
+        if reply and len(calls) > 1:
+            call["on_line"](json.dumps({"type": "item.completed", "item": {
+                "id": "reply", "type": "agent_message", "text": reply,
+            }}))
+            return types.SimpleNamespace(cancelled=False, timed_out=False, returncode=0,
+                                         stderr_tail="", raw_tail="")
+        assert call["cancel"].wait(5.0), "the run was never stopped"
+        return types.SimpleNamespace(cancelled=True, timed_out=False, returncode=-1,
+                                     stderr_tail="", raw_tail="")
+
+    return run
+
+
+def test_a_silent_codex_run_is_restarted_once_on_the_same_thread(launch_env, monkeypatch):
+    adapter, updater, kwargs, calls, events = launch_env
+    monkeypatch.setattr(adapter, "CODEX_SILENCE_LIMIT_S", 0.3)
+    adapter.run_streaming_process.side_effect = _silent_run(calls, reply="Done after restart")
+    result = adapter.CodexAdapter().launch(**kwargs, mode="agent")
+    assert adapter.run_streaming_process.call_count == 2
+    assert result.ok, result.error
+    assert "Done after restart" in (result.reply_text or "")
+    assert updater.update_cli.call_count == 0
+    assert any("printed nothing" in str(e.get("text", "")) for e in events if isinstance(e, dict))
+    second = " ".join(str(a) for a in calls[1]["argv"])
+    assert "resume" in second and "thread-one" in second
+
+
+def test_a_run_silent_twice_ends_with_a_clear_error(launch_env, monkeypatch):
+    adapter, _, kwargs, calls, _ = launch_env
+    monkeypatch.setattr(adapter, "CODEX_SILENCE_LIMIT_S", 0.3)
+    adapter.run_streaming_process.side_effect = _silent_run(calls)
+    result = adapter.CodexAdapter().launch(**kwargs, mode="agent")
+    assert adapter.run_streaming_process.call_count == 2
+    assert not result.ok and result.status == "error"
+    assert "twice" in result.error and "same thread" in result.error
+    assert result.upstream_session_id == "thread-one"
+
+
+def test_the_persons_stop_is_forwarded_and_never_retried(launch_env):
+    adapter, _, kwargs, calls, _ = launch_env
+    stop = threading.Event()
+
+    def run(**call):
+        calls.append(call)
+        call["on_line"](json.dumps({"type": "thread.started", "thread_id": "thread-one"}))
+        stop.set()
+        assert call["cancel"].wait(5.0), "the person's stop never reached the process"
+        return types.SimpleNamespace(cancelled=True, timed_out=False, returncode=-1,
+                                     stderr_tail="", raw_tail="")
+
+    adapter.run_streaming_process.side_effect = run
+    result = adapter.CodexAdapter().launch(**kwargs, mode="agent", cancel=stop)
+    assert adapter.run_streaming_process.call_count == 1
+    assert not result.ok and result.status == "cancelled"
