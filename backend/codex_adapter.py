@@ -297,6 +297,22 @@ _DUCKY_TOOLS_HINT = (
 # web_search, pictures it looks at go through view_image. Codex cannot switch apply_patch
 # off; the rules above tell it never to use it. Image generation stays on: it runs nothing
 # and edits nothing, and the pictures it makes show in the chat (_keep_codex_pictures).
+_STREAM_DROP_MARKERS = (
+    "stream disconnected",
+    "websocket closed",
+    "before response.completed",
+    "reconnecting...",
+)
+
+
+def is_stream_drop(*texts: str | None) -> bool:
+    """True when a failed turn died on Codex's Responses WebSocket being closed by the
+    server (openai/codex issues 30933, 24533, 43517): the thread is fine, the transport
+    was not, so the same turn can be run again."""
+    blob = " ".join(str(t or "") for t in texts).lower()
+    return any(marker in blob for marker in _STREAM_DROP_MARKERS)
+
+
 DUCKY_ONLY_FLAGS = [
     "-c", "features.shell_tool=false",
     "-c", "features.unified_exec=false",
@@ -1433,6 +1449,62 @@ class CodexAdapter:
 
         if retry_stopped():
             return with_mode(result)
+        if not result.ok and is_stream_drop(result.error, state.error_text, proc.stderr_tail, proc.raw_tail):
+            # Codex's Responses WebSocket was closed by OpenAI mid-turn (an open Codex
+            # CLI issue; it reconnects, then gives up). The thread is intact, so run the
+            # same turn once more on it instead of leaving the chat stuck on an error.
+            push(
+                {
+                    "type": "status",
+                    "text": "Codex's connection to OpenAI dropped mid-turn — retrying once…",
+                    "conv_id": conv_id,
+                    "run_id": run_id,
+                }
+            )
+            resume_id = new_session or session_id
+            argv = build_codex_argv(
+                binary=binary,
+                prompt=launch_prompt,
+                model=model_id,
+                extra_args=extra_args,
+                session_id=resume_id,
+                image_paths=list(image_paths or []),
+                extra_flags=extra_flags,
+                reasoning_effort=effort,
+                mode=mode,
+            )
+            argv[-1:-1] = ["-c", profile_ready, *DUCKY_ONLY_FLAGS]
+            state = _CodexStream(conv_id, run_id, push)
+            proc = run_streaming_process(
+                argv=argv,
+                cwd=cwd,
+                env_extra=env,
+                conv_id=conv_id,
+                on_line=state.on_line,
+                timeout_s=timeout_s,
+                cancel=cancel,
+                stdin_data=stdin_prompt,
+            )
+            state.finish_unresolved_tools(cancelled=proc.cancelled)
+            blocks = state.finalize_blocks()
+            streamed_all = "".join(state.text_parts).strip()
+            reply = state.trailing_text() or ("" if blocks else streamed_all)
+            new_session = state.session_id or resume_id
+            result = finalize_cli_turn(
+                proc=proc,
+                reply=reply,
+                streamed=bool(streamed_all) or bool(blocks),
+                blocks=blocks,
+                session_id=resume_id,
+                new_session=new_session,
+                usage=state.usage,
+                agent_label="Codex",
+                timeout_s=timeout_s,
+                error_text=state.error_text,
+                stale_session_markers=("resume", "not found"),
+            )
+            if retry_stopped():
+                return with_mode(result)
         if result.ok or not should_heal_launch(
             result.error or "",
             result.reply_text or "",

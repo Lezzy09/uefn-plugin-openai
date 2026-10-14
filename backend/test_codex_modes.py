@@ -617,3 +617,65 @@ def test_command_exit_code_survives_live_event_and_checkpoint(launch_env, exit_c
     assert event["tool"]["result"].startswith(f"Exit code: {exit_code}\n")
     assert stream.finalize_blocks()[-1]["result"]["data"].startswith(f"Exit code: {exit_code}\n")
     assert stream.error_text == ""
+
+
+def test_stream_drop_is_recognised():
+    from importlib import import_module
+    here = Path(__file__).resolve().parent
+    name = "_ducky_codex_drop"
+    package = types.ModuleType(name)
+    package.__path__ = [str(here)]
+    sys.modules[name] = package
+    try:
+        adapter = import_module(name + ".codex_adapter")
+        assert adapter.is_stream_drop("stream disconnected before completion: websocket closed by server before response.completed")
+        assert adapter.is_stream_drop("", "Reconnecting... 2/2", "")
+        assert not adapter.is_stream_drop("Codex turn failed: invalid model", "", None)
+        assert not adapter.is_stream_drop()
+    finally:
+        sys.modules.pop(name, None)
+        sys.modules.pop(name + ".codex_adapter", None)
+
+
+def test_dropped_stream_is_retried_once_on_the_same_thread(launch_env):
+    adapter, updater, kwargs, calls, events = launch_env
+
+    def run(**call):
+        calls.append(call)
+        call["on_line"](json.dumps({"type": "thread.started", "thread_id": "thread-one"}))
+        if len(calls) == 1:
+            call["on_line"](json.dumps({"type": "error", "message": (
+                "stream disconnected before completion: websocket closed by server before response.completed")}))
+            return types.SimpleNamespace(cancelled=False, timed_out=False, returncode=1,
+                                         stderr_tail="ERROR: Reconnecting... 2/2", raw_tail="")
+        call["on_line"](json.dumps({"type": "item.completed", "item": {
+            "id": "reply", "type": "agent_message", "text": "Done after retry",
+        }}))
+        return types.SimpleNamespace(cancelled=False, timed_out=False, returncode=0,
+                                     stderr_tail="", raw_tail="")
+
+    adapter.run_streaming_process.side_effect = run
+    result = adapter.CodexAdapter().launch(**kwargs, mode="agent")
+    assert adapter.run_streaming_process.call_count == 2
+    assert result.ok, result.error
+    assert "Done after retry" in (result.reply_text or "")
+    assert updater.update_cli.call_count == 0
+    assert any("retrying once" in str(e.get("text", "")) for e in events if isinstance(e, dict))
+    second = " ".join(str(a) for a in calls[1]["argv"])
+    assert "resume" in second and "thread-one" in second
+
+
+def test_a_real_error_is_not_retried(launch_env):
+    adapter, updater, kwargs, calls, events = launch_env
+
+    def run(**call):
+        calls.append(call)
+        call["on_line"](json.dumps({"type": "thread.started", "thread_id": "thread-one"}))
+        call["on_line"](json.dumps({"type": "error", "message": "invalid model: nope"}))
+        return types.SimpleNamespace(cancelled=False, timed_out=False, returncode=1,
+                                     stderr_tail="", raw_tail="")
+
+    adapter.run_streaming_process.side_effect = run
+    result = adapter.CodexAdapter().launch(**kwargs, mode="agent")
+    assert adapter.run_streaming_process.call_count == 1
+    assert not result.ok
