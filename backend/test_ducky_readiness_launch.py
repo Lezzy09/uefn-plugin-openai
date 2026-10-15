@@ -178,3 +178,50 @@ def test_ducky_readiness_normal_launch_keeps_mcp_required(launch_env, tmp_path, 
     # In particular, an MCP failure cannot retry as a shell-only turn.
     process.assert_called_once()
     update.assert_not_called()
+
+
+def test_project_codex_config_servers_are_switched_off(launch_env, tmp_path):
+    """Epic's GenerateClientConfig writes .codex/config.toml with unreal-mcp into the project."""
+    adapter, process, update, config, events, kwargs, resolve = launch_env
+    (tmp_path / ".codex").mkdir()
+    (tmp_path / ".codex" / "config.toml").write_text(  # home: Codex's own config, untouched
+        '[mcp_servers.personal]\ncommand = "personal-server"\n', encoding="utf-8")
+    game = tmp_path / "Games" / "MyGame"
+    (game / ".codex").mkdir(parents=True)
+    (game / ".codex" / "config.toml").write_text(
+        '[mcp_servers.unreal-mcp]\nurl = "http://127.0.0.1:8000/mcp"\n\n'
+        '[mcp_servers.helper]\ncommand = "npx"\nargs = ["-y", "helper"]\n\n'
+        '[mcp_servers.uefn]\ncommand = "stale-bridge"\n',
+        encoding="utf-8",
+    )
+    (tmp_path / "Games" / ".codex").mkdir()
+    (tmp_path / "Games" / ".codex" / "config.toml").write_text("not = [valid", encoding="utf-8")
+
+    flags = adapter.project_mcp_off_flags(str(game))
+    servers = {}
+    for flag, value in zip(flags[::2], flags[1::2]):
+        assert flag == "-c"
+        servers.update(tomllib.loads(value)["mcp_servers"])
+    assert servers == {
+        "unreal-mcp": {"url": "http://127.0.0.1:8000/mcp", "enabled": False},
+        "helper": {"command": "npx", "enabled": False},
+    }
+
+    seen = []
+
+    def run(**call):
+        seen.append(call["argv"])
+        call["on_line"](json.dumps({"type": "item.completed", "item": {
+            "id": "reply", "type": "agent_message", "text": "ok",
+        }}))
+        return types.SimpleNamespace(cancelled=False, timed_out=False, returncode=0,
+                                     stderr_tail="", raw_tail="")
+
+    process.side_effect = run
+    result = adapter.CodexAdapter().launch(**{**kwargs, "cwd": str(game)}, session_id="")
+    assert result.ok
+    argv = seen[0]
+    for i in range(0, len(flags), 2):
+        at = argv.index(flags[i + 1])
+        assert argv[at - 1] == "-c" and at < len(argv) - 1
+    assert not any("personal" in part for part in argv)

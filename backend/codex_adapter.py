@@ -9,10 +9,12 @@ from __future__ import annotations
 import inspect
 import json
 import os
+import re
 import shlex
 import tempfile
 import threading
 import time
+import tomllib
 from pathlib import Path
 from typing import Any, Callable
 
@@ -433,6 +435,47 @@ _EXEC_ONLY_BARE = {"--approve-for-me", "--oss"}
 
 def _toml_quote(value: str) -> str:
     return json.dumps(value or "", ensure_ascii=False)
+
+
+_BARE_TOML_KEY = re.compile(r"[A-Za-z0-9_-]+")
+
+
+def project_mcp_off_flags(cwd: str) -> list[str]:
+    """``-c`` overrides that switch off the MCP servers a project's own .codex/config.toml adds.
+
+    Codex reads that file in trusted projects, from the working folder up. Epic's
+    ``ModelContextProtocol.GenerateClientConfig`` writes one with ``unreal-mcp``, which
+    would give the agent a line to the editor past Ducky. Each override repeats the
+    server's transport so it stays a valid server when Codex skips the file (an untrusted
+    project). The home folder and above hold Codex's own config and are left alone.
+    """
+    flags: list[str] = []
+    seen: set[str] = set()
+    try:
+        here = Path(cwd).resolve()
+        home = Path.home().resolve()
+    except (OSError, RuntimeError):
+        return flags
+    for folder in (here, *here.parents):
+        if folder == home or folder in home.parents:
+            break
+        try:
+            data = tomllib.loads((folder / ".codex" / "config.toml").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        servers = data.get("mcp_servers")
+        for name, server in servers.items() if isinstance(servers, dict) else ():
+            if name == "uefn" or name in seen or not isinstance(server, dict) or not _BARE_TOML_KEY.fullmatch(name):
+                continue
+            if isinstance(server.get("url"), str):
+                transport = "url=" + _toml_quote(server["url"])
+            elif isinstance(server.get("command"), str):
+                transport = "command=" + _toml_quote(server["command"])
+            else:
+                continue
+            seen.add(name)
+            flags += ["-c", f"mcp_servers.{name}={{{transport}, enabled=false}}"]
+    return flags
 
 
 _BYPASS_FLAG = "--dangerously-bypass-approvals-and-sandbox"
@@ -1443,7 +1486,8 @@ class CodexAdapter:
         )
         # Last command-specific override wins over saved Agent extras. This
         # immutable value is reused on setup repair and works with resume.
-        argv[-1:-1] = ["-c", profile_ready, *DUCKY_ONLY_FLAGS]
+        project_off = project_mcp_off_flags(cwd)
+        argv[-1:-1] = ["-c", profile_ready, *DUCKY_ONLY_FLAGS, *project_off]
         def run_codex(argv: list[str], state: _CodexStream) -> tuple[Any, bool]:
             """One Codex process; True when the silence watchdog, not the person, stopped it."""
             with _SilenceWatchdog(cancel, CODEX_SILENCE_LIMIT_S) as watchdog:
@@ -1538,7 +1582,7 @@ class CodexAdapter:
                 reasoning_effort=effort,
                 mode=mode,
             )
-            argv[-1:-1] = ["-c", profile_ready, *DUCKY_ONLY_FLAGS]
+            argv[-1:-1] = ["-c", profile_ready, *DUCKY_ONLY_FLAGS, *project_off]
             state = _CodexStream(conv_id, run_id, push)
             proc, stalled = run_codex(argv, state)
             state.finish_unresolved_tools(cancelled=proc.cancelled)
