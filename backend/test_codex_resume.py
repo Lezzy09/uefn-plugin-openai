@@ -192,12 +192,9 @@ def test_codex_models_without_cli_cache_uses_fallback(tmp_path: Path):
     ca._codex_catalog_path = lambda: tmp_path / "missing.json"
     ca._refresh_cli_catalog_in_background = lambda: None
     try:
-        rows = _codex_model_rows()
-        ids = {r["id"] for r in rows}
-        assert "auto" in ids
-        assert "gpt-6-astra" in ids
-        assert "gpt-5.6-terra" in ids
-        assert "gpt-5.1-codex" not in ids
+        # Only Auto until Codex says which models the account has: guessed rows went
+        # stale (gpt-6-astra vanished for ChatGPT accounts on Oct 15 2026).
+        assert [r["id"] for r in _codex_model_rows()] == ["auto"]
     finally:
         ca._codex_catalog_path = orig_path
         ca._refresh_cli_catalog_in_background = orig_refresh

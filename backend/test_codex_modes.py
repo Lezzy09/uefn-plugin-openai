@@ -741,3 +741,171 @@ def test_the_persons_stop_is_forwarded_and_never_retried(launch_env):
     result = adapter.CodexAdapter().launch(**kwargs, mode="agent", cancel=stop)
     assert adapter.run_streaming_process.call_count == 1
     assert not result.ok and result.status == "cancelled"
+
+
+# Oct 15 2026: Codex stopped offering gpt-6.1-sol and gpt-6-astra to this ChatGPT account.
+# Exactly what `codex exec --json -m gpt-6.1-sol` printed then (exit code 1):
+_SOL_REFUSED = json.dumps({"type": "error", "status": 400, "error": {
+    "type": "invalid_request_error",
+    "message": "The 'gpt-6.1-sol' model is not supported when using Codex with a ChatGPT account.",
+}})
+_SOL_REFUSED_LINES = [
+    json.dumps({"type": "thread.started", "thread_id": "thread-one"}),
+    json.dumps({"type": "item.completed", "item": {"id": "item_0", "type": "error", "message": (
+        "Model metadata for `gpt-6.1-sol` not found. Defaulting to fallback metadata; "
+        "this can degrade performance and cause issues.")}}),
+    json.dumps({"type": "turn.started"}),
+    json.dumps({"type": "error", "message": _SOL_REFUSED}),
+    json.dumps({"type": "turn.failed", "error": {"message": _SOL_REFUSED}}),
+]
+_OFFERED = ["gpt-6-luna", "gpt-5.6-terra", "gpt-5.6-luna"]
+_OFFERED_TEXT = "Codex offers gpt-6-luna, gpt-5.6-terra, gpt-5.6-luna. Pick one of those for this chat."
+
+
+def _write_models_cache(home: Path, slugs: list[str]) -> None:
+    models = [{"slug": slug, "display_name": slug.upper(), "visibility": "list", "priority": i}
+              for i, slug in enumerate(slugs)]
+    models.append({"slug": "codex-auto-review", "visibility": "hide", "priority": 43})
+    (home / "models_cache.json").write_text(json.dumps({"models": models}), encoding="utf-8")
+
+
+def test_a_model_codex_refuses_is_a_clear_error_never_the_raw_json(launch_env, tmp_path, monkeypatch):
+    adapter, updater, kwargs, calls, events = launch_env
+    picker = Mock()
+    monkeypatch.setattr(adapter, "_refresh_model_picker", picker)
+    _write_models_cache(tmp_path, ["gpt-6.1-sol", *_OFFERED])  # the list before the run
+
+    def run(**call):
+        calls.append(call)
+        _write_models_cache(tmp_path, _OFFERED)  # Codex refetched it at start-up
+        for line in _SOL_REFUSED_LINES:
+            call["on_line"](line)
+        return types.SimpleNamespace(cancelled=False, timed_out=False, returncode=1,
+                                     stderr_tail="Reading additional input from stdin...\n",
+                                     raw_tail="\n".join(_SOL_REFUSED_LINES))
+
+    adapter.run_streaming_process.side_effect = run
+    result = adapter.CodexAdapter().launch(**{**kwargs, "model": "gpt-6.1-sol"}, mode="agent")
+    assert adapter.run_streaming_process.call_count == 1  # not a dropped stream: no retry
+    assert updater.update_cli.call_count == 0
+    assert not result.ok and result.status == "error"
+    assert result.error == "This model isn't available for your ChatGPT account: gpt-6.1-sol. " + _OFFERED_TEXT
+    # Ducky turns a failed turn's output tail into the reply when there is none.
+    assert result.output_tail == "" and result.reply_text == ""
+    assert result.upstream_session_id == "thread-one"
+    picker.assert_called_once_with()
+    shown = [str(e.get("text", "")) for e in events] + [result.error]
+    assert not any('"type"' in text or "{" in text for text in shown)
+
+
+@pytest.mark.parametrize("raw,shown", [
+    (_SOL_REFUSED, "This model isn't available for your ChatGPT account: gpt-6.1-sol. Pick another model for this chat."),
+    ('unexpected status 400 Bad Request: {"detail":"The \'gpt-6-astra\' model is not supported when using Codex with a ChatGPT account."}',
+     "This model isn't available for your ChatGPT account: gpt-6-astra. Pick another model for this chat."),
+    (json.dumps({"error": {"message": json.dumps({"error": {"message": "Rate limit reached"}})}}), "Rate limit reached"),
+    ('unexpected status 401 Unauthorized: {"error":{"message":"Your session has expired. Please log in again."}}',
+     "Your session has expired. Please log in again."),
+    ("stream disconnected before completion: websocket closed by server before response.completed",
+     "stream disconnected before completion: websocket closed by server before response.completed"),
+    ('{"items": [1, 2]}', '{"items": [1, 2]}'),
+    ("{not json", "{not json"),
+    ("", ""),
+])
+def test_codex_error_text_is_the_message_inside_the_error_body(launch_env, raw, shown):
+    adapter = launch_env[0]  # no models_cache.json in this CODEX_HOME
+    assert adapter.codex_error_text(raw) == shown
+
+
+def test_a_turn_failed_with_a_plain_string_error_still_fails_the_turn(launch_env):
+    adapter = launch_env[0]
+    stream = adapter._CodexStream("chat", "run", lambda event: None)
+    stream.on_line(json.dumps({"type": "turn.failed", "error": "Quota exceeded"}))
+    assert stream.error_text == "Quota exceeded"
+    stream.on_line(json.dumps({"type": "turn.failed"}))
+    assert stream.error_text == "Codex turn failed"
+
+
+def test_codex_json_is_never_the_error_of_a_turn_without_one(launch_env):
+    adapter, _, kwargs, calls, _ = launch_env
+    lines = [json.dumps({"type": "thread.started", "thread_id": "thread-one"}), json.dumps({"type": "turn.started"})]
+
+    def run(**call):
+        calls.append(call)
+        for line in lines:
+            call["on_line"](line)
+        return types.SimpleNamespace(cancelled=False, timed_out=False, returncode=3,
+                                     stderr_tail="", raw_tail="\n".join(lines))
+
+    adapter.run_streaming_process.side_effect = run
+    result = adapter.CodexAdapter().launch(**kwargs, mode="agent")
+    assert not result.ok and result.status == "error"
+    assert result.error == "Codex stopped without a reply (exit code 3)."
+    assert result.output_tail == ""
+
+
+@pytest.mark.parametrize("session", ["", "thread-one"])
+def test_a_model_codex_no_longer_lists_is_flagged_before_the_turn(launch_env, tmp_path, monkeypatch, session):
+    adapter, _, kwargs, calls, events = launch_env
+    _write_models_cache(tmp_path, _OFFERED)
+    fresh = Mock(return_value=list(_OFFERED))
+    picker = Mock()
+    monkeypatch.setattr(adapter, "_fresh_offered_models", fresh)
+    monkeypatch.setattr(adapter, "_refresh_model_picker", picker)
+    result = adapter.CodexAdapter().launch(**{**kwargs, "model": "gpt-6-astra"}, mode="agent", session_id=session)
+    assert not result.ok and result.status == "error"
+    assert result.error == "This model isn't available for your ChatGPT account: gpt-6-astra. " + _OFFERED_TEXT
+    assert result.upstream_session_id == session  # the thread carries on with another model
+    assert result.requested_mode == "agent" and result.effective_mode == ""
+    assert not calls and not events  # no Codex run, no "Starting Codex…"
+    fresh.assert_called_once_with("codex.exe")
+    picker.assert_called_once_with()
+
+
+@pytest.mark.parametrize("model,cache,fresh_list,checks_cli", [
+    ("gpt-6-luna", _OFFERED, None, False),  # listed: no CLI call before the turn
+    ("auto", _OFFERED, None, False),  # Codex picks
+    ("gpt-6.2-nova", None, None, False),  # no cache yet: nothing to check against
+    ("gpt-6.2-nova", _OFFERED, [*_OFFERED, "gpt-6.2-nova"], True),  # stale cache: the fresh list has it
+    ("gpt-6.2-nova", _OFFERED, [], True),  # the CLI could not say: Codex decides
+])
+def test_a_model_the_account_may_have_is_never_blocked(launch_env, tmp_path, monkeypatch, model, cache, fresh_list, checks_cli):
+    adapter, _, kwargs, calls, _ = launch_env
+    if cache is not None:
+        _write_models_cache(tmp_path, cache)
+    fresh = Mock(return_value=fresh_list)
+    monkeypatch.setattr(adapter, "_fresh_offered_models", fresh)
+    monkeypatch.setattr(adapter, "_refresh_model_picker", Mock(side_effect=AssertionError("picker refresh")))
+    result = adapter.CodexAdapter().launch(**{**kwargs, "model": model}, mode="agent")
+    assert result.ok, result.error
+    assert len(calls) == 1
+    assert fresh.called is checks_cli
+
+
+@pytest.mark.parametrize("outcome,offered", [
+    ("listed", ["gpt-6-luna", "gpt-5.6-terra"]),
+    ("failed", []),
+    ("garbage", []),
+    ("timeout", []),
+    ("missing", []),
+])
+def test_the_fresh_model_list_comes_from_codex_debug_models(launch_env, monkeypatch, outcome, offered):
+    import subprocess
+
+    adapter, updater, *_ = launch_env
+    catalog = {"models": [
+        {"slug": "gpt-6-luna", "visibility": "list", "priority": 4},
+        {"slug": "gpt-reserve", "visibility": "hide", "priority": 4},
+        {"slug": "gpt-5.6-terra", "visibility": "list", "priority": 8},
+    ]}
+
+    def run_cli(argv, *, timeout_s):
+        assert argv == ["codex.exe", "debug", "models"] and timeout_s <= 30
+        if outcome == "timeout":
+            raise subprocess.TimeoutExpired(argv, timeout_s)
+        if outcome == "missing":
+            raise FileNotFoundError(argv[0])
+        stdout = "not json" if outcome == "garbage" else json.dumps(catalog)
+        return types.SimpleNamespace(returncode=1 if outcome == "failed" else 0, stdout=stdout, stderr="")
+
+    monkeypatch.setattr(updater, "_run", run_cli)
+    assert adapter._fresh_offered_models("codex.exe") == offered

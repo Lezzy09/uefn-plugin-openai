@@ -11,6 +11,7 @@ import json
 import os
 import re
 import shlex
+import subprocess
 import tempfile
 import threading
 import time
@@ -65,17 +66,10 @@ def _launch_result(**kwargs: Any) -> CodingAgentLaunchResult:
 _CODEX_INSTALL_PS = r"irm https://chatgpt.com/codex/install.ps1 | iex"
 _CODEX_INSTALL_NPM = "npm install -g @openai/codex"
 
-# Last resort when ~/.codex/models_cache.json is missing (fresh CLI install).
-# Live picker rows come from that cache / `codex debug models` — ChatGPT login,
-# no API key. Same idea as Anthropic's public deprecations table.
-_CODEX_FALLBACK_MODELS: tuple[tuple[str, str], ...] = (
-    ("auto", "Auto"),
-    ("gpt-6-astra", "GPT-6 Astra"),
-    ("gpt-5.6-sol", "GPT-5.6 Sol"),
-    ("gpt-5.6-terra", "GPT-5.6 Terra"),
-    ("gpt-5.6-luna", "GPT-5.6 Luna"),
-    ("gpt-5.5", "GPT-5.5"),
-)
+# Last resort when ~/.codex/models_cache.json is missing (fresh CLI install): Auto
+# only, so the picker never offers a model the account may not have. Live picker rows
+# come from that cache / `codex debug models` — ChatGPT login, no API key.
+_CODEX_FALLBACK_MODELS: tuple[tuple[str, str], ...] = (("auto", "Auto"),)
 
 
 def _is_codex_auto_model(model: str) -> bool:
@@ -215,6 +209,104 @@ def _codex_model_rows() -> list[dict[str, Any]]:
         seen.add(mid)
         rows.append(row)
     return rows
+
+
+def _offered_models(data: Any = None) -> list[str]:
+    """Model ids Codex lists for this account: the cached catalog, or ``data`` when given."""
+    rows = parse_codex_catalog(data) if data is not None else _read_codex_cli_catalog() or []
+    return [str(row["id"]) for row in rows]
+
+
+def _fresh_offered_models(binary: str) -> list[str]:
+    """The account's list straight from the CLI; `codex debug models` refetches a stale cache."""
+    from .cli_update import _run as run_cli
+
+    try:
+        proc = run_cli([binary, "debug", "models"], timeout_s=30)
+        return _offered_models(json.loads(proc.stdout or "")) if proc.returncode == 0 else []
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return []
+
+
+def _refresh_model_picker() -> None:
+    """The picker re-reads the catalog now, not when its 10-minute detect cache expires."""
+    try:
+        from backend.agent.coding_agents.base import invalidate_detect_cache, kick_detect_refresh
+
+        invalidate_detect_cache()
+        kick_detect_refresh()
+    except Exception:
+        pass
+
+
+_UNAVAILABLE_MODEL = "This model isn't available for your ChatGPT account"
+
+
+def unavailable_model_error(model: str, offered: list[str]) -> str:
+    text = f"{_UNAVAILABLE_MODEL}: {model}."
+    if offered:
+        return text + f" Codex offers {', '.join(offered)}. Pick one of those for this chat."
+    return text + " Pick another model for this chat."
+
+
+def model_unavailable_error(model: str, binary: str) -> str:
+    """A chat or default model Codex no longer lists for this account, caught before the turn.
+
+    ``models_cache.json`` is the list as of Codex's last run. A model missing from it is
+    checked against a fresh list, so a stale cache never blocks a model the account has.
+    """
+    if _is_codex_auto_model(model):
+        return ""
+    cached = _offered_models()
+    if not cached or model in cached:
+        return ""
+    fresh = _fresh_offered_models(binary)
+    if not fresh or model in fresh:
+        return ""
+    _refresh_model_picker()
+    return unavailable_model_error(model, fresh)
+
+
+_UNSUPPORTED_MODEL_RE = re.compile(
+    r"the '([^']+)' model is not supported when using codex with a chatgpt account", re.I
+)
+_HTTP_STATUS_PREFIX_RE = re.compile(r"^unexpected status \d+[^:{]*:\s*", re.I)
+
+
+def _error_body_message(data: Any) -> str:
+    if not isinstance(data, dict):
+        return ""
+    err = data.get("error")
+    if isinstance(err, dict):
+        err = err.get("message")
+    found = err if isinstance(err, str) else data.get("message") or data.get("detail")
+    return found.strip() if isinstance(found, str) else ""
+
+
+def codex_error_text(raw: str) -> str:
+    """The readable part of a Codex error event.
+
+    Codex passes OpenAI's error body on as the message, e.g.
+    ``{"type":"error","status":400,"error":{"message":"The 'gpt-6.1-sol' model is not
+    supported when using Codex with a ChatGPT account."}}`` (older CLIs prefix it with
+    ``unexpected status 400 Bad Request:``). The chat shows the message inside.
+    """
+    text = str(raw or "").strip()
+    for _ in range(3):  # a body can carry another body as its message
+        body = _HTTP_STATUS_PREFIX_RE.sub("", text, count=1)
+        if not body.startswith("{"):
+            break
+        try:
+            inner = _error_body_message(json.JSONDecoder().raw_decode(body)[0])
+        except ValueError:
+            break
+        if not inner:
+            break
+        text = inner
+    unsupported = _UNSUPPORTED_MODEL_RE.search(text)
+    if unsupported:
+        return unavailable_model_error(unsupported.group(1), _offered_models())
+    return text
 
 
 def _codex_missing_status() -> str:
@@ -1062,8 +1154,9 @@ class _CodexStream:
             self._on_usage(data.get("usage") or {})
             return
         if kind == "turn.failed":
-            err = data.get("error") or {}
-            self.error_text = str(err.get("message") or "") or "Codex turn failed"
+            err = data.get("error")
+            message = err.get("message") if isinstance(err, dict) else err
+            self.error_text = codex_error_text(str(message or "")) or "Codex turn failed"
             return
         if kind == "error":
             msg = str(data.get("message") or "") or "Codex error"
@@ -1071,7 +1164,7 @@ class _CodexStream:
             if "reconnect" in msg.lower():
                 self._emit_status(msg)
             else:
-                self.error_text = msg
+                self.error_text = codex_error_text(msg) or "Codex error"
             return
         # Legacy protocol shape: {"id":..,"msg":{"type":"agent_message","message":"..."}}
         msg = data.get("msg")
@@ -1086,7 +1179,7 @@ class _CodexStream:
             elif mtype == "token_count":
                 self._on_usage(msg.get("info") or msg.get("usage") or {})
             elif mtype == "error":
-                self.error_text = str(msg.get("message") or "") or "Codex error"
+                self.error_text = codex_error_text(str(msg.get("message") or "")) or "Codex error"
 
     def _on_usage(self, usage: dict[str, Any]) -> None:
         if not isinstance(usage, dict) or not usage:
@@ -1290,6 +1383,37 @@ class _CodexStream:
         self._items.clear()
 
 
+def _finish_codex_turn(proc: Any, state: _CodexStream, *, session_id: str, timeout_s: float) -> CodingAgentLaunchResult:
+    """One Codex run's result. Whatever ended the turn, open tool chips are resolved."""
+    state.finish_unresolved_tools(cancelled=proc.cancelled)
+    blocks = state.finalize_blocks()
+    # Text before tool calls lives in blocks; the trailing segment is the
+    # final answer (all of it when no tools ran).
+    streamed_all = "".join(state.text_parts).strip()
+    result = finalize_cli_turn(
+        proc=proc,
+        reply=state.trailing_text() or ("" if blocks else streamed_all),
+        streamed=bool(streamed_all) or bool(blocks),
+        blocks=blocks,
+        session_id=session_id,
+        new_session=state.session_id or session_id,
+        usage=state.usage,
+        agent_label="Codex",
+        timeout_s=timeout_s,
+        error_text=state.error_text,
+        stale_session_markers=("resume", "not found"),
+    )
+    # Ducky shows a failed turn's output tail as the reply when it has none. Codex's
+    # stdout is its JSON event stream: never a reply, and never the error either.
+    result.output_tail = ""
+    raw_tail = str(getattr(proc, "raw_tail", "") or "")
+    if raw_tail and result.error == raw_tail:
+        result.error = f"Codex stopped without a reply (exit code {proc.returncode})."
+    if (result.error or "").startswith(_UNAVAILABLE_MODEL):
+        _refresh_model_picker()
+    return result
+
+
 class CodexAdapter:
     id = "codex"
     label = "Codex"
@@ -1441,6 +1565,16 @@ class CodexAdapter:
                     status="error",
                     requested_mode=mode,
                 )
+        unavailable = model_unavailable_error(model_id, binary)
+        if unavailable:
+            # Say so before the turn instead of letting OpenAI refuse it (a 400) mid-chat.
+            return _launch_result(
+                ok=False,
+                error=unavailable,
+                status="error",
+                upstream_session_id=session_id,
+                requested_mode=mode,
+            )
         full_prompt = prompt
         # System context only on the first turn; the resumed thread keeps it.
         if system_prompt.strip() and not session_id:
@@ -1514,30 +1648,8 @@ class CodexAdapter:
         else:
             push({"type": "status", "text": "Starting Codex…", "conv_id": conv_id, "run_id": run_id})
         proc, stalled = run_codex(argv, state)
+        result = _finish_codex_turn(proc, state, session_id=session_id, timeout_s=timeout_s)
 
-        # Never leave a chip spinning: whatever ended this turn, resolve leftovers.
-        state.finish_unresolved_tools(cancelled=proc.cancelled)
-        blocks = state.finalize_blocks()
-
-        # Text before tool calls lives in blocks; the trailing segment is the
-        # final answer (all of it when no tools ran).
-        streamed_all = "".join(state.text_parts).strip()
-        reply = state.trailing_text() or ("" if blocks else streamed_all)
-        new_session = state.session_id or session_id
-
-        result = finalize_cli_turn(
-            proc=proc,
-            reply=reply,
-            streamed=bool(streamed_all) or bool(blocks),
-            blocks=blocks,
-            session_id=session_id,
-            new_session=new_session,
-            usage=state.usage,
-            agent_label="Codex",
-            timeout_s=timeout_s,
-            error_text=state.error_text,
-            stale_session_markers=("resume", "not found"),
-        )
         def retry_stopped() -> bool:
             # Terminal output can also contain repair markers. Never replay
             # uncertain work, or begin repair after observing cancellation.
@@ -1570,7 +1682,7 @@ class CodexAdapter:
                     "run_id": run_id,
                 }
             )
-            resume_id = new_session or session_id
+            resume_id = state.session_id or session_id
             argv = build_codex_argv(
                 binary=binary,
                 prompt=launch_prompt,
@@ -1585,24 +1697,7 @@ class CodexAdapter:
             argv[-1:-1] = ["-c", profile_ready, *DUCKY_ONLY_FLAGS, *project_off]
             state = _CodexStream(conv_id, run_id, push)
             proc, stalled = run_codex(argv, state)
-            state.finish_unresolved_tools(cancelled=proc.cancelled)
-            blocks = state.finalize_blocks()
-            streamed_all = "".join(state.text_parts).strip()
-            reply = state.trailing_text() or ("" if blocks else streamed_all)
-            new_session = state.session_id or resume_id
-            result = finalize_cli_turn(
-                proc=proc,
-                reply=reply,
-                streamed=bool(streamed_all) or bool(blocks),
-                blocks=blocks,
-                session_id=resume_id,
-                new_session=new_session,
-                usage=state.usage,
-                agent_label="Codex",
-                timeout_s=timeout_s,
-                error_text=state.error_text,
-                stale_session_markers=("resume", "not found"),
-            )
+            result = _finish_codex_turn(proc, state, session_id=resume_id, timeout_s=timeout_s)
             if retry_stopped():
                 return with_mode(result)
             if stalled:
@@ -1658,21 +1753,4 @@ class CodexAdapter:
             cancel=cancel,
             stdin_data=stdin_prompt,
         )
-        state.finish_unresolved_tools(cancelled=proc.cancelled)
-        blocks = state.finalize_blocks()
-        streamed_all = "".join(state.text_parts).strip()
-        reply = state.trailing_text() or ("" if blocks else streamed_all)
-        new_session = state.session_id or session_id
-        return with_mode(finalize_cli_turn(
-            proc=proc,
-            reply=reply,
-            streamed=bool(streamed_all) or bool(blocks),
-            blocks=blocks,
-            session_id=session_id,
-            new_session=new_session,
-            usage=state.usage,
-            agent_label="Codex",
-            timeout_s=timeout_s,
-            error_text=state.error_text,
-            stale_session_markers=("resume", "not found"),
-        ))
+        return with_mode(_finish_codex_turn(proc, state, session_id=session_id, timeout_s=timeout_s))
