@@ -70,9 +70,26 @@ def test_real_nonterminal_repair_classifier_retains_flags(launch_env, mode, sess
 
 
 @pytest.mark.parametrize("missing", [True, False])
-def test_sandboxed_launch_never_installs_codex(launch_env, monkeypatch, missing):
+@pytest.mark.parametrize("instance", ["skip_env", "core_port", "older_core_port"])
+def test_second_instance_heal_never_installs_codex(launch_env, monkeypatch, missing, instance):
+    """A heal in a sandboxed build (DUCKY_SKIP_CLI_UPDATE=1 or panel port 4300)
+    reports Codex missing here and never runs the installer, which would add the
+    sandbox's LOCALAPPDATA bin dir to the person's real user PATH."""
     module, updater, kwargs, _calls, events = launch_env
-    monkeypatch.setattr(updater, "sandbox_skip_reason", lambda: "panel port 4300 is not the default 4200")
+    install = Mock(side_effect=AssertionError("Codex installer ran"))
+    monkeypatch.setattr(updater, "_install_cli", install)
+    monkeypatch.setattr(updater, "_run", Mock(side_effect=AssertionError("codex update ran")))
+    updater.update_cli.side_effect = None  # the real updater, should anything reach it
+    if instance == "skip_env":
+        monkeypatch.setenv("DUCKY_SKIP_CLI_UPDATE", "1")
+        reason = "DUCKY_SKIP_CLI_UPDATE is set"
+    else:
+        reason = "panel port 4300 is not the default 4200"
+        monkeypatch.setenv("UEFN_DUCKY_PANEL_PORT", "4300")
+        if instance == "core_port":
+            sys.modules["frontend.ide_apply"].auto_apply_skip_reason = lambda: reason
+        else:
+            monkeypatch.setitem(sys.modules, "frontend.ide_apply", None)  # core without the check
     if missing:
         monkeypatch.setattr(updater, "resolve_bin", Mock(return_value=""))
     else:
@@ -80,9 +97,10 @@ def test_sandboxed_launch_never_installs_codex(launch_env, monkeypatch, missing)
             cancelled=False, timed_out=False, returncode=1,
             stderr_tail="no such file or directory", raw_tail="")
     result = module.CodexAdapter().launch(**kwargs, mode="agent", session_id="thread-one")
-    updater.update_cli.assert_not_called()
+    install.assert_not_called()
+    updater._run.assert_not_called()
     assert module.run_streaming_process.call_count == (0 if missing else 1)
-    assert not result.ok and "sandboxed (panel port 4300 is not the default 4200)" in result.error
+    assert not result.ok and f"in this Ducky instance ({reason})" in result.error
     assert not any("automatically" in e.get("text", "") for e in events)
 
 
@@ -292,9 +310,15 @@ def launch_env(tmp_path, monkeypatch):
     adapter = importlib.import_module(name + ".codex_adapter")
     updater = importlib.import_module(name + ".cli_update")
     monkeypatch.setattr(updater, "resolve_bin", Mock(return_value="codex.exe"))
-    monkeypatch.setattr(updater, "update_cli", Mock(side_effect=AssertionError("Unexpected install")))
-    # tmp_path as USERPROFILE/LOCALAPPDATA reads as a sandbox to core; these tests run the heal.
-    monkeypatch.setattr(updater, "sandbox_skip_reason", lambda: "")
+    # side_effect=None with no return_value runs the real updater.
+    monkeypatch.setattr(updater, "update_cli", Mock(
+        wraps=updater.update_cli, side_effect=AssertionError("Unexpected install")))
+    # conftest's panel port and tmp_path as USERPROFILE/LOCALAPPDATA read as a
+    # sandbox to core; these tests run the heal unless they say otherwise.
+    core_check = types.ModuleType("frontend.ide_apply")
+    core_check.auto_apply_skip_reason = lambda: ""
+    monkeypatch.setitem(sys.modules, "frontend.ide_apply", core_check)
+    monkeypatch.delenv("DUCKY_SKIP_CLI_UPDATE", raising=False)
     monkeypatch.setattr(adapter, "codex_extra_dirs", lambda _: [tmp_path / "other-project"])
     calls, events = [], []
 

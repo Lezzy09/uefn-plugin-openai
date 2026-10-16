@@ -6,9 +6,12 @@ import types
 from pathlib import Path
 from unittest.mock import Mock
 
+import pytest
+
 import cli_update
 from cli_update import (
     hidden_run_kwargs,
+    install_skip_reason,
     npm_argv,
     is_cli_broken_binary_error,
     is_cli_missing_error,
@@ -21,6 +24,7 @@ from cli_update import (
     sandbox_skip_reason,
     schedule_cli_update_on_plugin_load,
     should_heal_launch,
+    update_cli,
 )
 
 
@@ -85,12 +89,53 @@ def _core_reason(monkeypatch, reason):
 
 
 def test_sandbox_reason_comes_from_core(monkeypatch):
-    _core_reason(monkeypatch, "panel port 4300 is not the default 4200")
-    assert sandbox_skip_reason() == "panel port 4300 is not the default 4200"
+    monkeypatch.setenv("UEFN_DUCKY_PANEL_PORT", "4300")
+    _core_reason(monkeypatch, "LOCALAPPDATA is not this Windows user's own AppData\\Local")
+    assert sandbox_skip_reason() == "LOCALAPPDATA is not this Windows user's own AppData\\Local"
     _core_reason(monkeypatch, "")
     assert sandbox_skip_reason() == ""
     monkeypatch.setitem(sys.modules, "frontend.ide_apply", None)  # older core: no check
+    assert sandbox_skip_reason() == "panel port 4300 is not the default 4200"
+    monkeypatch.setenv("UEFN_DUCKY_PANEL_PORT", "4200")
     assert sandbox_skip_reason() == ""
+    monkeypatch.delenv("UEFN_DUCKY_PANEL_PORT")
+    assert sandbox_skip_reason() == ""
+
+
+@pytest.mark.parametrize("instance", ["skip_env", "core_port", "older_core_port"])
+def test_second_instance_update_never_runs_installer(monkeypatch, instance):
+    install = Mock(side_effect=AssertionError("Codex installer ran"))
+    run = Mock(side_effect=AssertionError("codex update ran"))
+    monkeypatch.setattr(cli_update, "_install_cli", install)
+    monkeypatch.setattr(cli_update, "_run", run)
+    monkeypatch.setattr(cli_update, "resolve_bin", Mock(return_value=""))
+    monkeypatch.setattr(cli_update, "write_stamp", Mock(side_effect=AssertionError("stamp written")))
+    monkeypatch.setattr(cli_update, "_last", {})
+    monkeypatch.setenv("UEFN_DUCKY_PANEL_PORT", "4300")
+    if instance == "skip_env":
+        monkeypatch.setenv("DUCKY_SKIP_CLI_UPDATE", "1")
+        _core_reason(monkeypatch, "")
+        reason = "DUCKY_SKIP_CLI_UPDATE is set"
+    else:
+        monkeypatch.delenv("DUCKY_SKIP_CLI_UPDATE", raising=False)
+        reason = "panel port 4300 is not the default 4200"
+        if instance == "core_port":
+            _core_reason(monkeypatch, reason)
+        else:
+            monkeypatch.setitem(sys.modules, "frontend.ide_apply", None)
+    assert install_skip_reason() == reason
+    for override in ("", "codex.exe"):
+        result = update_cli(override)
+        assert result["ok"] is False and reason in result["error"]
+    install.assert_not_called()
+    run.assert_not_called()
+
+    monkeypatch.delenv("DUCKY_SKIP_CLI_UPDATE", raising=False)
+    _core_reason(monkeypatch, "")
+    install.side_effect = None
+    install.return_value = {"ok": False, "error": "offline"}
+    assert update_cli("") == {"ok": False, "error": "offline"}  # the person's own Ducky still installs
+    install.assert_called_once()
 
 
 def test_sandboxed_plugin_load_never_installs(monkeypatch):

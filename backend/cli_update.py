@@ -16,6 +16,7 @@ from typing import Any
 _BIN = "codex"
 _NPM_PKG = "@openai/codex"
 _INSTALL_PS = "irm https://chatgpt.com/codex/install.ps1 | iex"
+_DEFAULT_PANEL_PORT = 4200
 _VERSION_RE = re.compile(r"(\d+(?:\.\d+)+)")
 _REQUIRED_RE = re.compile(
     r"does not support this model;\s*version\s+(\d+(?:\.\d+)+)\s+or newer",
@@ -283,6 +284,12 @@ def _install_cli() -> dict[str, Any]:
 
 def update_cli(override: str = "") -> dict[str, Any]:
     global _busy, _last
+    skip = install_skip_reason()
+    if skip:
+        # Every way in (plugin load, a launch with no Codex, the heal after a
+        # failed launch) ends here, so neither the installer nor `codex update`
+        # can touch the person's user PATH from a second instance.
+        return {"ok": False, "error": f"this Ducky instance does not install or update Codex ({skip})"}
     with _update_lock:
         _busy = True
         try:
@@ -339,16 +346,36 @@ def sandbox_skip_reason() -> str:
     (own LOCALAPPDATA/USERPROFILE, panel port 4300) has no update stamp, so it
     ran the installer on every load and piled dead sandbox bin dirs into the
     person's real PATH. Core decides what counts as sandboxed; an older core
-    without the check counts as not sandboxed.
+    without the check falls back to the panel port, which every sandboxed build
+    moves off 4200.
     """
     try:
         from frontend.ide_apply import auto_apply_skip_reason
     except Exception:
-        return ""
+        return _panel_port_reason()
     try:
         return str(auto_apply_skip_reason() or "")
     except Exception:
-        return ""
+        return _panel_port_reason()
+
+
+def _panel_port_reason() -> str:
+    port = (os.environ.get("UEFN_DUCKY_PANEL_PORT") or "").strip()
+    if port and port != str(_DEFAULT_PANEL_PORT):
+        return f"panel port {port} is not the default {_DEFAULT_PANEL_PORT}"
+    return ""
+
+
+def install_skip_reason() -> str:
+    """Why this Ducky must not run Codex's installer or `codex update` ("" = it may).
+
+    Sandboxed test builds set DUCKY_SKIP_CLI_UPDATE; it used to stop only the
+    plugin-load update, so the heal after a failed launch still ran the
+    installer and added the sandbox's bin dir to the real user PATH.
+    """
+    if os.environ.get("DUCKY_SKIP_CLI_UPDATE"):
+        return "DUCKY_SKIP_CLI_UPDATE is set"
+    return sandbox_skip_reason()
 
 
 def needs_plugin_load_update() -> bool:
@@ -361,9 +388,9 @@ def needs_plugin_load_update() -> bool:
 
 
 def schedule_cli_update_on_plugin_load() -> None:
-    if os.environ.get("PYTEST_CURRENT_TEST") or os.environ.get("DUCKY_SKIP_CLI_UPDATE"):
+    if os.environ.get("PYTEST_CURRENT_TEST"):
         return
-    reason = sandbox_skip_reason()
+    reason = install_skip_reason()
     if reason:
         _log.info("Codex CLI auto-update skipped: %s", reason)
         return

@@ -1527,8 +1527,8 @@ class CodexAdapter:
 
         model_id = normalize_codex_model(model)
         from .cli_update import (
+            install_skip_reason,
             resolve_bin,
-            sandbox_skip_reason,
             should_heal_launch,
             update_cli,
         )
@@ -1552,14 +1552,14 @@ class CodexAdapter:
             )
 
         binary = resolve_bin(cli_path)
-        sandboxed = "" if binary else sandbox_skip_reason()
-        if sandboxed:
+        skip = "" if binary else install_skip_reason()
+        if skip:
             return _launch_result(
                 ok=False,
                 error=(
-                    "Codex CLI not found. This Ducky is sandboxed "
-                    f"({sandboxed}), so it does not install Codex: the installer "
-                    "changes your user PATH. Install Codex from your own Ducky."
+                    f"Codex CLI not found in this Ducky instance ({skip}). It does not "
+                    "install Codex here: the installer changes your user PATH. Install "
+                    "Codex from your own Ducky."
                 ),
                 status="error",
                 requested_mode=mode,
@@ -1735,12 +1735,13 @@ class CodexAdapter:
             return with_mode(result)
         if retry_stopped():
             return with_mode(result)
-        sandboxed = sandbox_skip_reason()
-        if sandboxed:
+        skip = install_skip_reason()
+        if skip:
             result.error = (
                 (result.error or "")
-                + f"\n\nThis Ducky is sandboxed ({sandboxed}), so it did not update Codex: "
-                "the installer changes your user PATH. Update Codex from your own Ducky."
+                + f"\n\nCodex looks missing or out of date in this Ducky instance ({skip}). "
+                "It does not install or update Codex here: the installer changes your user "
+                "PATH. Update Codex from your own Ducky."
             )
             return with_mode(result)
         push(
