@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import shutil
@@ -36,6 +37,7 @@ _BROKEN_BIN_MARKERS = (
 _update_lock = threading.Lock()
 _busy = False
 _last: dict[str, Any] = {}
+_log = logging.getLogger(__name__)
 
 
 def plugin_package_version() -> str:
@@ -329,6 +331,26 @@ def update_cli(override: str = "") -> dict[str, Any]:
             _busy = False
 
 
+def sandbox_skip_reason() -> str:
+    """Why this Ducky must not install or update Codex on its own ("" = it may).
+
+    Codex's installer prepends $env:LOCALAPPDATA\\Programs\\OpenAI\\Codex\\bin to
+    the persistent user PATH and installs into ~/.codex. A sandboxed test build
+    (own LOCALAPPDATA/USERPROFILE, panel port 4300) has no update stamp, so it
+    ran the installer on every load and piled dead sandbox bin dirs into the
+    person's real PATH. Core decides what counts as sandboxed; an older core
+    without the check counts as not sandboxed.
+    """
+    try:
+        from frontend.ide_apply import auto_apply_skip_reason
+    except Exception:
+        return ""
+    try:
+        return str(auto_apply_skip_reason() or "")
+    except Exception:
+        return ""
+
+
 def needs_plugin_load_update() -> bool:
     if not resolve_bin():
         return True
@@ -340,6 +362,10 @@ def needs_plugin_load_update() -> bool:
 
 def schedule_cli_update_on_plugin_load() -> None:
     if os.environ.get("PYTEST_CURRENT_TEST") or os.environ.get("DUCKY_SKIP_CLI_UPDATE"):
+        return
+    reason = sandbox_skip_reason()
+    if reason:
+        _log.info("Codex CLI auto-update skipped: %s", reason)
         return
     try:
         if not needs_plugin_load_update():

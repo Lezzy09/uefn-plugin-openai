@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import os
+import sys
+import types
 from pathlib import Path
+from unittest.mock import Mock
 
+import cli_update
 from cli_update import (
     hidden_run_kwargs,
     npm_argv,
@@ -14,6 +18,8 @@ from cli_update import (
     parse_version_tuple,
     plugin_package_version,
     resolve_bin,
+    sandbox_skip_reason,
+    schedule_cli_update_on_plugin_load,
     should_heal_launch,
 )
 
@@ -70,6 +76,44 @@ def test_npm_argv_skips_cmd(tmp_path, monkeypatch):
     assert argv[:2] == [str(node), str(cli)]
     if os.name == "nt":
         assert hidden_run_kwargs().get("startupinfo") is not None
+
+
+def _core_reason(monkeypatch, reason):
+    core = types.ModuleType("frontend.ide_apply")
+    core.auto_apply_skip_reason = lambda: reason
+    monkeypatch.setitem(sys.modules, "frontend.ide_apply", core)
+
+
+def test_sandbox_reason_comes_from_core(monkeypatch):
+    _core_reason(monkeypatch, "panel port 4300 is not the default 4200")
+    assert sandbox_skip_reason() == "panel port 4300 is not the default 4200"
+    _core_reason(monkeypatch, "")
+    assert sandbox_skip_reason() == ""
+    monkeypatch.setitem(sys.modules, "frontend.ide_apply", None)  # older core: no check
+    assert sandbox_skip_reason() == ""
+
+
+def test_sandboxed_plugin_load_never_installs(monkeypatch):
+    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+    monkeypatch.delenv("DUCKY_SKIP_CLI_UPDATE", raising=False)
+    needs = Mock(return_value=True)
+    started = []
+    monkeypatch.setattr(cli_update, "needs_plugin_load_update", needs)
+    monkeypatch.setattr(cli_update, "update_cli", Mock(side_effect=AssertionError("installer ran")))
+    monkeypatch.setattr(cli_update, "threading", types.SimpleNamespace(
+        Thread=lambda **kw: types.SimpleNamespace(start=lambda: started.append(kw["name"])),
+    ))
+    _core_reason(monkeypatch, "LOCALAPPDATA is not the Windows user's own folder")
+    schedule_cli_update_on_plugin_load()
+    assert started == [] and needs.call_count == 0
+
+    _core_reason(monkeypatch, "")
+    schedule_cli_update_on_plugin_load()
+    assert started == ["codex-cli-update"]
+
+    monkeypatch.setenv("DUCKY_SKIP_CLI_UPDATE", "1")
+    schedule_cli_update_on_plugin_load()
+    assert started == ["codex-cli-update"]
 
 
 def test_plugin_wires_auto_update():

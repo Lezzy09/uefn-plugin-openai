@@ -69,6 +69,23 @@ def test_real_nonterminal_repair_classifier_retains_flags(launch_env, mode, sess
         assert_mode_argv(argv, mode, session)
 
 
+@pytest.mark.parametrize("missing", [True, False])
+def test_sandboxed_launch_never_installs_codex(launch_env, monkeypatch, missing):
+    module, updater, kwargs, _calls, events = launch_env
+    monkeypatch.setattr(updater, "sandbox_skip_reason", lambda: "panel port 4300 is not the default 4200")
+    if missing:
+        monkeypatch.setattr(updater, "resolve_bin", Mock(return_value=""))
+    else:
+        module.run_streaming_process.side_effect = lambda **kw: types.SimpleNamespace(
+            cancelled=False, timed_out=False, returncode=1,
+            stderr_tail="no such file or directory", raw_tail="")
+    result = module.CodexAdapter().launch(**kwargs, mode="agent", session_id="thread-one")
+    updater.update_cli.assert_not_called()
+    assert module.run_streaming_process.call_count == (0 if missing else 1)
+    assert not result.ok and "sandboxed (panel port 4300 is not the default 4200)" in result.error
+    assert not any("automatically" in e.get("text", "") for e in events)
+
+
 @pytest.mark.parametrize("boundary", ["process", "classifier", "status", "updater"])
 def test_cancellation_arriving_at_retry_boundary(launch_env, monkeypatch, boundary):
     module, updater, kwargs, calls, events = launch_env
@@ -276,6 +293,8 @@ def launch_env(tmp_path, monkeypatch):
     updater = importlib.import_module(name + ".cli_update")
     monkeypatch.setattr(updater, "resolve_bin", Mock(return_value="codex.exe"))
     monkeypatch.setattr(updater, "update_cli", Mock(side_effect=AssertionError("Unexpected install")))
+    # tmp_path as USERPROFILE/LOCALAPPDATA reads as a sandbox to core; these tests run the heal.
+    monkeypatch.setattr(updater, "sandbox_skip_reason", lambda: "")
     monkeypatch.setattr(adapter, "codex_extra_dirs", lambda _: [tmp_path / "other-project"])
     calls, events = [], []
 

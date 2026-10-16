@@ -1526,7 +1526,12 @@ class CodexAdapter:
             return result
 
         model_id = normalize_codex_model(model)
-        from .cli_update import resolve_bin, should_heal_launch, update_cli
+        from .cli_update import (
+            resolve_bin,
+            sandbox_skip_reason,
+            should_heal_launch,
+            update_cli,
+        )
 
         try:
             profile_ready = write_codex_uefn_profile(mcp_config_path, per_run=True)
@@ -1547,6 +1552,18 @@ class CodexAdapter:
             )
 
         binary = resolve_bin(cli_path)
+        sandboxed = "" if binary else sandbox_skip_reason()
+        if sandboxed:
+            return _launch_result(
+                ok=False,
+                error=(
+                    "Codex CLI not found. This Ducky is sandboxed "
+                    f"({sandboxed}), so it does not install Codex: the installer "
+                    "changes your user PATH. Install Codex from your own Ducky."
+                ),
+                status="error",
+                requested_mode=mode,
+            )
         if not binary:
             push(
                 {
@@ -1717,6 +1734,14 @@ class CodexAdapter:
         ):
             return with_mode(result)
         if retry_stopped():
+            return with_mode(result)
+        sandboxed = sandbox_skip_reason()
+        if sandboxed:
+            result.error = (
+                (result.error or "")
+                + f"\n\nThis Ducky is sandboxed ({sandboxed}), so it did not update Codex: "
+                "the installer changes your user PATH. Update Codex from your own Ducky."
+            )
             return with_mode(result)
         push(
             {
