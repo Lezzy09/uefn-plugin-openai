@@ -1409,6 +1409,9 @@ def _finish_codex_turn(proc: Any, state: _CodexStream, *, session_id: str, timeo
     raw_tail = str(getattr(proc, "raw_tail", "") or "")
     if raw_tail and result.error == raw_tail:
         result.error = f"Codex stopped without a reply (exit code {proc.returncode})."
+    # OpenAI refused Codex's credentials (none, expired or revoked): a sign-in, not an error.
+    if result.status == "error" and "401 unauthorized" in (result.error or "").lower():
+        result.status = "needs_login"
     if (result.error or "").startswith(_UNAVAILABLE_MODEL):
         _refresh_model_picker()
     return result
@@ -1437,19 +1440,25 @@ class CodexAdapter:
 
         path = resolve_bin(override)
         default_args = str(cfg.get("default_args") or "--full-auto")
+        logged_in: bool | None = None
         if path:
+            from .codex_auth import codex_logged_in
+
+            logged_in = codex_logged_in(override or path)
             ver = read_cli_version(path)
             extra = status_text()
             status = f"Found: {path}"
             if ver:
                 status += f" · v{ver}"
+            if logged_in is not None:
+                status += " · logged in" if logged_in else " · not logged in (chat will prompt)"
             if extra and extra not in status:
                 status += f" · {extra}"
             available = enabled
         else:
             status = _codex_missing_status()
             available = False
-        return CodingAgentInfo(
+        info = CodingAgentInfo(
             id=self.id,
             label=self.label,
             enabled=enabled,
@@ -1460,6 +1469,9 @@ class CodexAdapter:
             capabilities=self.capabilities,
             models=_codex_model_rows(),
         )
+        # An attribute, not a ctor kwarg, as in Claude Code's detect: older app builds load it too.
+        info.logged_in = logged_in  # type: ignore[attr-defined]
+        return info
 
     def launch(
         self,
