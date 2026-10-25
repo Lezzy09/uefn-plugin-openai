@@ -952,3 +952,40 @@ def test_the_fresh_model_list_comes_from_codex_debug_models(launch_env, monkeypa
 
     monkeypatch.setattr(updater, "_run", run_cli)
     assert adapter._fresh_offered_models("codex.exe") == offered
+
+
+def test_codex_starts_in_its_own_process_group(launch_env):
+    module, _, kwargs, calls, _ = launch_env
+    assert module.CodexAdapter().launch(**kwargs).ok
+    assert calls and all(call["new_process_group"] is True for call in calls)
+
+
+def test_stop_sends_ctrl_break_once_to_the_chats_codex(launch_env, monkeypatch):
+    import signal
+
+    from backend.agent.coding_agents import proc_exec
+
+    module = launch_env[0]
+    proc = Mock()
+    asked: list[str] = []
+    monkeypatch.setattr(proc_exec, "get_process", lambda cid: asked.append(cid) or proc, raising=False)
+    assert module.CodexAdapter().request_stop("conversation") is True
+    expected = signal.CTRL_BREAK_EVENT if sys.platform == "win32" else signal.SIGINT
+    proc.send_signal.assert_called_once_with(expected)
+    assert asked == ["conversation"]
+
+
+def test_stop_without_a_process_or_an_older_core_asks_core_to_kill(launch_env, monkeypatch):
+    from backend.agent.coding_agents import proc_exec
+
+    module = launch_env[0]
+    monkeypatch.setattr(proc_exec, "get_process", lambda cid: None, raising=False)
+    assert module.CodexAdapter().request_stop("conversation") is False
+    gone = Mock(**{"send_signal.side_effect": OSError("exited")})
+    monkeypatch.setattr(proc_exec, "get_process", lambda cid: gone)
+    assert module.CodexAdapter().request_stop("conversation") is False
+    monkeypatch.delattr(proc_exec, "get_process")
+    assert module.CodexAdapter().request_stop("conversation") is False
+    monkeypatch.setattr(module, "_PROCESS_GROUP", {})
+    monkeypatch.setattr(proc_exec, "get_process", lambda cid: Mock(), raising=False)
+    assert module.CodexAdapter().request_stop("conversation") is False

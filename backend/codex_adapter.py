@@ -11,6 +11,7 @@ import json
 import os
 import re
 import shlex
+import signal
 import subprocess
 import tempfile
 import threading
@@ -43,6 +44,11 @@ def _legacy_normalize_mode(mode: str | None = "agent") -> str:
 normalize_coding_mode = getattr(_coding_base, "normalize_coding_mode", _legacy_normalize_mode)
 _CAPABILITY_PARAMETERS = inspect.signature(CodingAgentCapabilities).parameters
 _RESULT_PARAMETERS = inspect.signature(CodingAgentLaunchResult).parameters
+# Codex in its own process group so Stop's CTRL_BREAK reaches it alone; older cores lack it.
+_PROCESS_GROUP = (
+    {"new_process_group": True}
+    if "new_process_group" in inspect.signature(run_streaming_process).parameters else {}
+)
 _HOST_MODE_CONTRACT = (
     hasattr(_coding_base, "normalize_coding_mode")
     and "supported_modes" in _CAPABILITY_PARAMETERS
@@ -1432,6 +1438,27 @@ class CodexAdapter:
            if "supported_modes" in _CAPABILITY_PARAMETERS else {}),
     )
 
+    def request_stop(self, conv_id: str) -> bool:
+        """Stop asks first: CTRL_BREAK (SIGINT off Windows) so Codex ends the turn itself.
+
+        False (no live process, or a core without process groups / get_process) = core
+        kills at once; otherwise core still kills after its grace.
+        """
+        from backend.agent.coding_agents import proc_exec
+
+        get_process = getattr(proc_exec, "get_process", None)
+        if get_process is None or not _PROCESS_GROUP:
+            return False
+        proc = get_process(conv_id)
+        sig = getattr(signal, "CTRL_BREAK_EVENT", None) if os.name == "nt" else signal.SIGINT
+        if proc is None or sig is None:
+            return False
+        try:
+            proc.send_signal(sig)
+        except (OSError, ValueError):
+            return False
+        return True
+
     def detect(self, settings: Any) -> CodingAgentInfo:
         cfg = coding_agent_cfg(settings, self.id)
         enabled = bool(cfg.get("enabled", True))
@@ -1668,6 +1695,7 @@ class CodexAdapter:
                     timeout_s=timeout_s,
                     cancel=watchdog.cancel,
                     stdin_data=stdin_prompt,
+                    **_PROCESS_GROUP,
                 )
             return proc, watchdog.stalled
 
@@ -1790,5 +1818,6 @@ class CodexAdapter:
             timeout_s=timeout_s,
             cancel=cancel,
             stdin_data=stdin_prompt,
+            **_PROCESS_GROUP,
         )
         return with_mode(_finish_codex_turn(proc, state, session_id=session_id, timeout_s=timeout_s))
