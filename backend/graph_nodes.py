@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import base64
 import json
+import mimetypes
 import urllib.error
 import urllib.request
+import uuid
+from pathlib import Path
 from typing import Any
 
 NODES = ("openai.complete", "openai.image")
@@ -49,6 +52,30 @@ def _images_http(body: dict[str, Any], key: str) -> dict[str, Any]:
         return json.loads(resp.read().decode("utf-8"))
 
 
+def _edits_http(body: dict[str, Any], image: Path, key: str) -> dict[str, Any]:
+    """/images/edits: the same ask, starting from a reference picture (multipart)."""
+    boundary = uuid.uuid4().hex
+    parts = [f'--{boundary}\r\nContent-Disposition: form-data; name="{k}"\r\n\r\n{v}\r\n'.encode("utf-8") for k, v in body.items()]
+    mime = mimetypes.guess_type(image.name)[0] or "image/png"
+    parts.append(f'--{boundary}\r\nContent-Disposition: form-data; name="image"; filename="{image.name}"\r\n'
+                 f"Content-Type: {mime}\r\n\r\n".encode("utf-8") + image.read_bytes() + b"\r\n")
+    parts.append(f"--{boundary}--\r\n".encode("utf-8"))
+    req = urllib.request.Request(
+        "https://api.openai.com/v1/images/edits",
+        data=b"".join(parts),
+        headers={"Authorization": f"Bearer {key}", "Content-Type": f"multipart/form-data; boundary={boundary}"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=180) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def _image_path(value: Any) -> str:
+    """A picture's path from a path or a file ref ({path})."""
+    raw = value.get("path") if isinstance(value, dict) else value
+    return str(raw or "").strip()
+
+
 def handle_image(ctx: dict[str, Any]) -> dict[str, Any]:
     cfg, payload = _pair(ctx)
     prompt = str(cfg.get("prompt") or payload.get("prompt") or "").strip()
@@ -63,8 +90,12 @@ def handle_image(ctx: dict[str, Any]) -> dict[str, Any]:
     body: dict[str, Any] = {"model": model, "prompt": prompt, "n": 1, "size": size}
     if quality:
         body["quality"] = quality
+    # A reference picture (Edit Image: the same character from the side) makes it an edit.
+    image = _image_path(cfg.get("image") or payload.get("image"))
+    if image and not Path(image).is_file():
+        return {"ok": False, "error": f"reference picture not found: {image}"}
     try:
-        data = _images_http(body, key)
+        data = _edits_http(body, Path(image), key) if image else _images_http(body, key)
     except urllib.error.HTTPError as exc:
         return {"ok": False, "error": f"images API {exc.code}"}
     except OSError as exc:
